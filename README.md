@@ -1,198 +1,631 @@
-# SULAH — AI-Powered Mediation Platform
-**NLU Shimla — Intern Project 2026**
+# Sulah — AI-Powered Mediation Platform
+### National Law University Shimla | Legal Innovation and Incubation Cell (LIIC)
+### Built under India's Mediation Act 2023
 
-This document is for whoever inherits this codebase next. It explains what the project does, how the pieces fit together, what's solid, what's fragile, and where to look first.
-
----
-
-## 1. What this project is
-
-SULAH is a platform that lets two parties in a dispute (landlord/tenant, employment, business, neighbours, etc.) go through an AI-assisted mediation process with a human mediator supervising throughout. Nothing is fully automated — the AI drafts, extracts, and scores; the mediator reviews, edits, and publishes everything that a party actually sees.
-
-**High-level flow:**
-1. A mediator creates a case (or a party applies and a mediator accepts it) → both parties get one-time invitation links.
-2. Both parties fill out an intake wizard describing the dispute ("submissions").
-3. Once both submit, an AI pipeline ("Burst 1") runs: tone analysis, bias removal, conflict extraction, neutral summary, mediatability scoring.
-4. Mediator reviews Burst 1 results, then sends an AI-generated questionnaire to both parties.
-5. Once both answer, a second AI pipeline ("Burst 2") runs BATNA/WATNA (best/worst alternative to negotiated agreement) analysis.
-6. Mediator drafts a settlement proposal (AI-assisted first draft), edits it, and publishes it.
-7. Parties accept or reject. Rejections trigger an AI-generated revision (Sub-system H) for the next round (up to `max_rounds`, default 3, extendable).
-8. Once both accept, the mediator finalises the case, both parties digitally confirm, and a settlement PDF is generated and made available for download.
+**Live app:** [nlu-mediation-platform.vercel.app](https://nlu-mediation-platform.vercel.app/)
 
 ---
 
-## 2. Repo layout
+## Table of Contents
 
-```
-/
-├── ai/                      Python AI subsystems (no web framework — pure functions)
-│   ├── schemas.py           SINGLE SOURCE OF TRUTH for all AI output shapes (Pydantic)
-│   ├── subsystems/          subsystem_a.py .. subsystem_h.py (see section 4)
-│   ├── pipeline_burst1.py   Orchestrates Burst 1 (F, E, A, B, G)
-│   ├── pipeline_burst2.py   Orchestrates Burst 2 (D)
-│   ├── proposal_draft.py    First-draft proposal generator (plain text, not JSON)
-│   └── utils/ai_client.py   Shared LLM call wrapper (currently Groq, swappable to Claude)
-│
-├── nlu-backend/             FastAPI backend
-│   ├── main.py              App entrypoint, CORS config
-│   ├── app/
-│   │   ├── api/v1/routes/   auth, cases, documents, invitations, questionnaires, proposals, settlement
-│   │   ├── core/            security (JWT/bcrypt), database (Supabase client), state_machine.py, dependencies (auth guards)
-│   │   ├── models/          Pydantic request/response models
-│   │   └── services/pdf_generator.py   ReportLab settlement PDF builder
-│   ├── tasks.py             ⚠️ ACTUAL Celery tasks used in production (root-level, NOT app/worker/tasks.py)
-│   └── app/worker/celery_app.py   Older/parallel Celery setup — see warning in section 6
-│
-├── frontend/                React (Vite) SPA
-│   └── src/
-│       ├── pages/mediator/  Mediator-facing screens
-│       ├── pages/party/     Party-facing screens
-│       ├── api/ and services/  Two parallel axios client setups (see section 6)
-│       └── routes/AppRoutes.jsx   All routing, role-gated
-│
-├── tests/                   Python test scripts (not pytest — run as `python -m tests.xxx`) + scenario JSON fixtures
-└── docs/                    api-contract.md, state-machine.md, database.md — written specs (partially stale, see section 7)
-```
+1. [What This Is](#1-what-this-is)
+2. [System Architecture](#2-system-architecture)
+3. [Folder Structure](#3-folder-structure)
+4. [Tech Stack](#4-tech-stack)
+5. [AI Pipeline](#5-ai-pipeline)
+6. [Case Flow and State Machine](#6-case-flow-and-state-machine)
+7. [Database Schema](#7-database-schema)
+8. [Local Development Setup](#8-local-development-setup)
+9. [Deployment](#9-deployment)
+10. [Environment Variables](#10-environment-variables)
+11. [Known Limitations and Future Work](#11-known-limitations-and-future-work)
+12. [Original Intern Team](#12-original-intern-team)
 
 ---
 
-## 3. Tech stack
+## 1. What This Is
 
-| Layer | Choice |
+Sulah is a full-stack web application that digitises the formal mediation process under India's Mediation Act 2023.
+
+It allows citizens to file dispute applications online, receive AI-generated conflict analysis, and reach legally documented settlements through a structured mediator-supervised workflow.
+
+**Core principle:**
+
+> AI advises and drafts. The mediator decides and publishes. Parties make final acceptance decisions. AI never makes a legally consequential decision alone.
+
+### User Roles
+
+| Role | Description |
 |---|---|
-| Backend | FastAPI (Python), Supabase (Postgres + Storage), Redis (Upstash) + Celery for background jobs, JWT auth (python-jose + bcrypt) |
-| AI | Currently **Groq** (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) for cost reasons during dev. Designed to swap to Claude for production — see `ai/utils/ai_client.py`, the swap is a few lines (model names + client import) |
-| Frontend | React 19 + Vite 8 + React Router 7, plain inline `style={}` objects (no CSS framework in most pages; Tailwind is configured but barely used), Recharts for dashboard charts |
-| PDF generation | ReportLab (settlement PDF), with a DejaVu Sans font pulled from the `matplotlib` install specifically so the ₹ symbol renders |
+| `mediator` | Manages cases, reviews AI analysis, sends questionnaires, creates and publishes proposals, finalises settlements |
+| `party_user` | Shared account role for both the requesting party and the against party |
+
+Both disputing parties register with the same `party_user` role. Their case-specific identity — `requesting_party` or `against_party` — is not stored on the user record. It is determined dynamically per case via the `case_invitations` table.
+
+Use `GET /api/v1/cases/{case_id}/my-role` to resolve which party a logged-in user is in a given case.
 
 ---
 
-## 4. The AI pipeline (the heart of the project)
+## 2. System Architecture
 
-All AI subsystems live in `ai/subsystems/` and share Pydantic schemas from `ai/schemas.py`. **Never bypass schemas.py** — every downstream piece (Celery tasks, routes, frontend types implicitly) depends on those exact field names.
+```
+React Frontend (Vercel)
+        │
+        │ HTTPS + JWT
+        ▼
+FastAPI Backend (Render — Web Service)
+        │                    │
+        │                    │ .delay()
+        ▼                    ▼
+  Supabase              Redis (Upstash)
+  PostgreSQL                 │
+  (13 tables)                ▼
+                    Celery Worker (Render — Web Service)
+                             │
+                             ▼
+                    Groq LLM API
+                    (8 AI sub-systems)
+```
 
-| Sub-system | File | Input | Output | Runs in |
+**Important deployment note:** Render does not offer a free tier for Background Workers. The Celery worker is deployed as a Web Service on Render via `worker_web.py`, which exposes a `/` health endpoint. UptimeRobot pings it every 5–10 minutes to prevent Render's free tier from spinning the service down after 15 minutes of inactivity.
+
+---
+
+## 3. Folder Structure
+
+```
+nlu-mediation-platform/
+├── ai/                              # AI pipeline (Python)
+│   ├── subsystems/
+│   │   ├── subsystem_a.py           # Conflict extraction (large model)
+│   │   ├── subsystem_b.py           # Neutral summary (large model)
+│   │   ├── subsystem_c.py           # Questionnaire generation (small model)
+│   │   ├── subsystem_d.py           # BATNA/WATNA analysis (large model)
+│   │   ├── subsystem_e.py           # Bias removal (small model)
+│   │   ├── subsystem_f.py           # Tone analysis (small model)
+│   │   ├── subsystem_g.py           # Mediatability score (small model)
+│   │   └── subsystem_h.py           # Proposal revision (large model)
+│   ├── utils/
+│   │   └── ai_client.py             # Shared LLM client with retry logic
+│   ├── schemas.py                   # All Pydantic models for AI output
+│   ├── pipeline_burst1.py           # Canonical Burst 1 reference implementation
+│   ├── pipeline_burst2.py           # Burst 2 reference implementation
+│   └── proposal_draft.py            # Initial proposal generation
+│
+├── frontend/                        # React + Vite + TailwindCSS
+│   ├── src/
+│   │   ├── pages/
+│   │   │   ├── auth/                # Login, register, invitation accept
+│   │   │   ├── mediator/            # Mediator UI screens
+│   │   │   └── party/               # Party UI screens
+│   │   ├── routes/                  # AppRoutes, ProtectedRoute, RoleBasedRoute
+│   │   ├── api/                     # Axios API modules
+│   │   ├── services/                # Auth and domain services
+│   │   └── components/              # Shared UI components
+│   ├── index.html
+│   └── vite.config.js
+│
+├── nlu-backend/                     # FastAPI backend
+│   ├── app/
+│   │   ├── api/v1/
+│   │   │   ├── router.py            # Route aggregator
+│   │   │   └── routes/              # auth, cases, invitations, documents,
+│   │   │                            # questionnaires, proposals, settlement
+│   │   ├── core/
+│   │   │   ├── state_machine.py     # Case state transitions (golden rule)
+│   │   │   ├── database.py          # Supabase client
+│   │   │   ├── config.py            # Settings from .env
+│   │   │   ├── security.py          # JWT helpers
+│   │   │   └── dependencies.py      # FastAPI auth dependencies
+│   │   ├── models/                  # Pydantic request/response models
+│   │   ├── services/
+│   │   │   └── pdf_generator.py     # ReportLab settlement PDF
+│   │   └── worker/
+│   │       └── celery_app.py        # Alternate/legacy Celery app (dev/smoke tests)
+│   ├── tasks.py                     # Primary Celery task definitions (canonical — used in production)
+│   ├── worker_web.py                # Celery + FastAPI wrapper for Render
+│   ├── main.py                      # FastAPI entry point (top-level, not inside app/)
+│   ├── requirements.txt
+│   ├── .env.example                 # Backend environment template
+│   └── frontend.env.example         # Frontend environment template
+│
+├── tests/                           # Test scenarios S-01 to S-12
+│   ├── scenarios/
+│   └── test_*.py
+│
+├── docs/                            # Architecture and API docs
+│   ├── api-contract.md
+│   ├── database.md
+│   └── state-machine.md
+│
+└── README.md
+```
+
+> `main.py` lives at the top level of `nlu-backend/`, not inside `app/`. The correct entrypoint command is `uvicorn main:app`, not `uvicorn app.main:app`.
+
+---
+
+## 4. Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 19, Vite 8, TailwindCSS 3, React Router 7, Axios |
+| Backend | FastAPI, Python 3.11, Uvicorn |
+| Database | PostgreSQL via Supabase |
+| AI Models | Groq — `openai/gpt-oss-120b` (large), `openai/gpt-oss-20b` (small) |
+| Background Jobs | Celery 5 + Redis (Upstash) |
+| PDF Generation | ReportLab |
+| Authentication | JWT (HS256) |
+| Storage | Supabase Storage (`case-documents` bucket) |
+| Deployment | Render (backend + Celery worker), Vercel (frontend) |
+
+---
+
+## 5. AI Pipeline
+
+The platform has an **8-sub-system AI pipeline** split across two asynchronous Celery bursts.
+
+### Burst 1 — Triggered when both parties submit statements
+
+Canonical order (Final Flow — **do not reorder**):
+
+```
+Step 1: Sub-system F  — Tone analysis on RAW statements
+Step 2: Sub-system E  — Bias removal on RAW statements → cleaned text
+Step 3: Sub-system A  — Conflict extraction on CLEANED text  ← CRITICAL
+Step 4: Sub-system B  — Neutral summary from conflict JSON
+Step 5: Sub-system G  — Mediatability score (Python scoring + LLM text)
+```
+
+**Why this order matters:**
+
+- **F before E:** Tone analysis must capture true emotional signal from raw text. Once E cleans the statements, that signal is lost.
+- **E before A (critical):** Bias removal must run before conflict extraction. If emotional or loaded language reaches A, extracted claims are biased — and everything downstream (B, G, C, D) builds on A's output.
+- **A before B and G:** Neutral summary and mediatability both consume A's structured JSON output.
+
+**Sub-system A is the only critical step.** If A fails, the pipeline stops and the case transitions to `PROCESSING_FAILED`. All other sub-system failures degrade gracefully with warning badges.
+
+The authoritative reference implementation is `ai/pipeline_burst1.py`. Celery invokes this pipeline via `process_burst_1` in `nlu-backend/tasks.py`.
+
+### Burst 2 — Triggered when both parties complete the questionnaire
+
+```
+Sub-system D — BATNA/WATNA analysis
+Input:  ConflictExtraction (Burst 1) + both parties' questionnaire answers
+Output: Negotiation position per party, settlement zone
+```
+
+### Proposal Generation and Revision
+
+```
+proposal_draft.py  — generates initial draft (mediator action)
+Sub-system H       — generates revised draft after any party rejection
+                      (mediator notes are fed here only — never into Burst 1 or 2)
+```
+
+### Sub-System Reference
+
+| Sub-system | File | Model | Input | Critical? |
 |---|---|---|---|---|
-| A — Conflict Extraction | `subsystem_a.py` | raw/cleaned party statements | `ConflictExtraction` (dispute_type, claims, disputed/undisputed facts, confidence) | Burst 1 — **critical path**, pipeline stops if this fails |
-| B — Neutral Summary | `subsystem_b.py` | `ConflictExtraction` | `NeutralSummary` | Burst 1 |
-| C — Questionnaire | `subsystem_c.py` | `ConflictExtraction` | `QuestionnaireOutput` (8-10 targeted questions) | Triggered manually by mediator, between Burst 1 and Burst 2 |
-| D — BATNA/WATNA | `subsystem_d.py` | `ConflictExtraction` + questionnaire answers | `BatnaWatnaOutput` (per-party strength labels; **numeric scores are internal only**, parties never see them) | Burst 2 |
-| E — Bias Removal | `subsystem_e.py` | raw statement OR `NeutralSummary` | `BiasRemovalOutput` | Burst 1 (runs twice: once on raw text before A, once on the generated summary) |
-| F — Tone Analysis | `subsystem_f.py` | raw statements | `ToneAnalysis` (mediator-only, never shown to parties) | Burst 1 |
-| G — Mediatability Score | `subsystem_g.py` | `ConflictExtraction` | `MediatabilitySore` (yes, spelled "Sore" — intentional, do not rename, it's wired everywhere) — **score is deterministic Python math, not LLM output**; only the justification text comes from the LLM | Burst 1 |
-| H — Proposal Revision | `subsystem_h.py` | rejected proposal text + rejection reasons + BATNA/WATNA | revised draft + changes summary | Triggered on any party rejection |
+| A | `subsystem_a.py` | large | Cleaned statements | **Yes** |
+| B | `subsystem_b.py` | large | ConflictExtraction | No |
+| C | `subsystem_c.py` | small | ConflictExtraction | No |
+| D | `subsystem_d.py` | large | ConflictExtraction + questionnaire answers | No |
+| E | `subsystem_e.py` | small | Raw statements | No |
+| F | `subsystem_f.py` | small | Raw statements | No |
+| G | `subsystem_g.py` | small | ConflictExtraction | No |
+| H | `subsystem_h.py` | large | Rejected proposal + reasons + BATNA/WATNA | No |
 
-Pipeline order (`ai/pipeline_burst1.py`): **F on raw text → E on raw text (Party A & B separately) → A on E's cleaned output → B on A's output → G on A's output**, run in that sequence (not fully parallel despite the docs occasionally saying so — the actual code in `pipeline_burst1.py` and `tasks.py` runs sequentially).
+**Model mapping:** large model = `openai/gpt-oss-120b`, small model = `openai/gpt-oss-20b` (both via Groq, defined in `ai/utils/ai_client.py`).
 
-**Known quirks to know about before touching this:**
-- `ai/utils/ai_client.py` uses Groq's free tier. It has a `call_with_retry` wrapper (3 retries, feeds the previous error back to the model) used for structured JSON output, plus `call_large_text` / `call_large_json` for plain-text/dict output used by proposal drafting and revision.
-- Every subsystem function returns either a validated Pydantic model **or** a `{"status": "failed", ...}` dict. **Always check `is_failed(result)` before touching fields** — this convention is used everywhere, don't break it.
-- `BatnaWatnaOutput` has a `model_validator` that force-corrects `watna_score > batna_score` by averaging both — this is a safety net, not a bug.
+### Key AI Engineering Decisions
+
+**Mediatability score is Python, not LLM:**
+
+LLM scores are non-deterministic — the same input can produce different numbers on different runs, which mediators can't trust. The score is calculated deterministically using weighted Python factors (monetary value, jurisdiction clarity, extraction confidence, undisputed facts count, dispute type suitability). The LLM writes only the justification paragraph; if that text generation fails, a fallback string is used and the score itself is never at risk.
+
+**BATNA invariant enforced in Pydantic, not the prompt:**
+
+BATNA score must always be >= WATNA score (mathematically required — best alternative cannot be worse than worst alternative). Prompts can be ignored by LLMs; Python validators cannot. A `model_validator` on `PartyNegotiationPosition` in `ai/schemas.py` enforces this on every LLM response:
+
+```python
+if self.watna_score > self.batna_score:
+    avg = (self.batna_score + self.watna_score) // 2
+    self.batna_score = avg
+    self.watna_score = avg
+```
+
+If the model returns BATNA=4, WATNA=7, both are corrected to (5, 5) — averaging is safer than swapping, because neither original value is trustworthy.
+
+**Mediator notes only reach Sub-system H:**
+
+Burst 1 and Burst 2 must stay unbiased — based only on party statements and questionnaire answers. Feeding mediator notes into earlier analysis would skew results toward mediator bias rather than reflecting the parties' own input. Sub-system H is the only place mediator notes are used, during proposal revision, where the mediator is explicitly and appropriately guiding the outcome.
+
+**Retry logic:**
+
+Every LLM call retries up to 3 times via `ai/utils/ai_client.py`. On failure, the error is fed back to the model for self-correction. After 3 failures, non-critical sub-systems degrade gracefully.
 
 ---
 
-## 5. State machine (this is the backbone of the backend)
+## 6. Case Flow and State Machine
 
-`nlu-backend/app/core/state_machine.py` is the **single source of truth** for case status. The golden rule, enforced by convention (not by DB trigger): **no route, no Celery task ever writes `cases.status` directly** — everything goes through `transition(case_id, new_state, actor_id)`, which validates the transition against a `VALID_TRANSITIONS` set and writes an audit log row atomically-ish (two separate REST calls, not a real DB transaction — see the long comment in the file for why that's an accepted tradeoff for MVP).
+### Two Case Creation Paths — Mediator Always Creates the Case
 
-Full state list and transition table: see `docs/state-machine.md` (kept mostly in sync, but double check against the `VALID_TRANSITIONS` set in code — code wins if they disagree).
+Under the Mediation Act 2023, the mediator is a neutral appointee — not an initiator. The mediator formally creates every case in both paths, even when a party files the initial application. `cases.created_by` is always the mediator's `user_id` — this is intentional, not a bug.
 
-Key states: `BOTH_INVITED → FIRST_PARTY_SUBMITTED → BOTH_SUBMITTED → BURST_1_PROCESSING → BURST_1_COMPLETE → QUESTIONNAIRE_ACTIVE → QUESTIONNAIRE_COMPLETE → BURST_2_PROCESSING → BURST_2_COMPLETE → PROPOSAL_DRAFT → PROPOSAL_PUBLISHED → (MEDIATION_COMPLETE | MEDIATION_IN_PROGRESS → loop back to PROPOSAL_DRAFT) → MEDIATION_COMPLETE`. Failures at either AI burst go to `PROCESSING_FAILED`, from which a mediator can retry.
+**Path 1 — Party initiated:**
 
-If you ever get a 409 `INVALID_TRANSITION` and think it's wrong, **the fix is always to add the pair to `VALID_TRANSITIONS`**, never to call the DB directly to bypass it.
+```
+Party files application (APPLICATION_PENDING)
+  → Mediator reviews application
+  → Mediator accepts
+  → Mediator formally creates case + sends invitations to both parties
+```
+
+**Path 2 — Mediator initiated:**
+
+```
+Mediator creates case directly
+  → Generates invitation links
+  → Shares with both parties
+```
+
+Both paths merge at `BOTH_INVITED`. From that point forward, Path 1 and Path 2 are identical.
+
+### State Machine — 16 States
+
+The state machine in `nlu-backend/app/core/state_machine.py` is the **only** path to changing case status. No route handler, Celery task, or helper function may set `case.status` directly. All changes go through `transition()`. Invalid transitions return HTTP 409 Conflict. Every transition is written to `audit_logs` (insert-only, never deleted).
+
+**Application request states (Path 1 only — `application_requests` table)**
+
+| State | Description |
+|---|---|
+| `APPLICATION_PENDING` | Party filed request, waiting for mediator |
+| `APPLICATION_REJECTED` | Mediator rejected the request |
+| `WITHDRAWN` | Party withdrew before mediator acted |
+
+**Case states (both paths — `cases` table)**
+
+| State | Description |
+|---|---|
+| `BOTH_INVITED` | Case created, both invitation links generated |
+| `FIRST_PARTY_SUBMITTED` | One party submitted intake, waiting for other |
+| `BOTH_SUBMITTED` | Both submitted — Burst 1 triggers automatically |
+| `BURST_1_PROCESSING` | AI Burst 1 pipeline running |
+| `BURST_1_COMPLETE` | AI analysis ready for mediator review |
+| `QUESTIONNAIRE_ACTIVE` | Mediator sent questionnaire to both parties |
+| `QUESTIONNAIRE_COMPLETE` | Both parties answered — Burst 2 triggers |
+| `BURST_2_PROCESSING` | BATNA/WATNA AI pipeline running |
+| `BURST_2_COMPLETE` | BATNA/WATNA results ready |
+| `PROPOSAL_DRAFT` | Mediator created proposal, not visible to parties |
+| `PROPOSAL_PUBLISHED` | Proposal published, parties can respond |
+| `MEDIATION_IN_PROGRESS` | At least one party rejected, revision in progress |
+| `MEDIATION_COMPLETE` | Both parties accepted a proposal |
+
+**Failure and recovery states (also on `cases` table)**
+
+| State | Description |
+|---|---|
+| `PROCESSING_FAILED` | AI pipeline failed — mediator can retry |
+| `MEDIATION_FAILED` | Max negotiation rounds exhausted with no agreement |
+
+### Valid Transitions
+
+```
+APPLICATION_PENDING  → APPLICATION_REJECTED
+APPLICATION_PENDING  → WITHDRAWN
+APPLICATION_PENDING  → BOTH_INVITED          (mediator accepts application)
+
+BOTH_INVITED         → FIRST_PARTY_SUBMITTED
+BOTH_INVITED         → BOTH_SUBMITTED         (simultaneous submission edge case)
+FIRST_PARTY_SUBMITTED → BOTH_SUBMITTED
+
+BOTH_SUBMITTED       → BURST_1_PROCESSING
+BURST_1_PROCESSING   → BURST_1_COMPLETE
+BURST_1_PROCESSING   → PROCESSING_FAILED
+
+BURST_1_COMPLETE     → QUESTIONNAIRE_ACTIVE
+QUESTIONNAIRE_ACTIVE → QUESTIONNAIRE_COMPLETE
+QUESTIONNAIRE_COMPLETE → BURST_2_PROCESSING
+BURST_2_PROCESSING   → BURST_2_COMPLETE
+BURST_2_PROCESSING   → PROCESSING_FAILED
+
+BURST_2_COMPLETE     → PROPOSAL_DRAFT
+PROPOSAL_DRAFT       → PROPOSAL_PUBLISHED
+PROPOSAL_PUBLISHED   → MEDIATION_COMPLETE    (both parties accept)
+PROPOSAL_PUBLISHED   → MEDIATION_IN_PROGRESS (any party rejects)
+MEDIATION_IN_PROGRESS → PROPOSAL_DRAFT       (mediator creates revised proposal)
+MEDIATION_IN_PROGRESS → MEDIATION_COMPLETE   (both accept revised proposal)
+MEDIATION_IN_PROGRESS → MEDIATION_FAILED     (max rounds exhausted)
+MEDIATION_COMPLETE   → MEDIATION_COMPLETE     (mediator finalise — audit log only)
+
+PROCESSING_FAILED    → BURST_1_PROCESSING     (mediator retry — Burst 1)
+PROCESSING_FAILED    → BURST_2_PROCESSING     (mediator retry — Burst 2)
+```
 
 ---
 
-## 6. ⚠️ Things that are duplicated / inconsistent — read before you refactor
+## 7. Database Schema
 
-This codebase was built by multiple people in parallel across several weeks, and a few things never got fully reconciled. A new developer should know about these rather than accidentally "fixing" one and breaking the one actually in use.
+13 tables in Supabase PostgreSQL.
 
-- **Two Celery task files exist**: `nlu-backend/tasks.py` (root-level) is the one actually imported by routes (`from tasks import process_burst_1`, etc.) and used in production. `nlu-backend/app/worker/celery_app.py` is an earlier/parallel setup with its own `hello_task`, `process_burst_1`, etc. **Treat `tasks.py` as canonical.** The `app/worker/` version appears to be legacy — confirm before deleting, but don't build on it.
-- **Two frontend API client setups**: `frontend/src/api/client.js` (raw axios, base URL only) and `frontend/src/services/api.js` (axios with `/api/v1` baked into the base URL, plus a chunk of dev-only mock/localStorage-override logic for demoing settlement PDFs — see the `generateJSMediatorPDF` function and the interceptor overrides in that file). Most newer pages import from `services/api.js`. **Before wiring a new page, check which one sibling pages use** — mixing them causes double `/api/v1/api/v1/` prefix bugs (this has happened before, see comments in `frontend/src/api/cases.js`).
-- **`frontend/src/services/api.js` contains demo/mock-mode logic** (checks `localStorage` for `case_status_${caseId}` overrides, generates a client-side jsPDF settlement doc as a fallback). This looks like leftover demo scaffolding from a presentation. It should probably be removed before a real production deploy, but confirm with the team first — some pages may rely on it still working offline.
-- **`ai/schemas.py`'s `MediatabilitySore` class name has a typo** ("Sore" not "Score"). This is intentional/frozen — it's referenced by name across the Celery pipeline, routes, and possibly frontend expectations. Don't "fix" the typo without a full search-and-replace across all three layers.
-- **Groq vs Claude**: the whole AI layer currently runs on Groq's free tier for cost reasons during development. Before any real deployment, swap `LARGE_MODEL`/`SMALL_MODEL` in `ai/utils/ai_client.py` to Claude model strings and swap the `Groq` client for `Anthropic` (the comment block at the top of that file has the intended swap already sketched out).
-- **`docs/*.md` files lag behind code** in places (e.g. `docs/api-contract.md`'s error-code names, `docs/state-machine.md`'s Week 2 renames section). Treat these as *helpful context*, not ground truth — always check the actual route/model code.
+| Table | Purpose |
+|---|---|
+| `users` | Mediators and party users (`mediator` or `party_user` role) |
+| `cases` | Core case record — `created_by` is always the mediator |
+| `application_requests` | Path 1 party applications |
+| `case_invitations` | Invitation tokens per party (`requesting_party` / `against_party`) |
+| `submissions` | Party dispute statements (6-step intake wizard) |
+| `ai_analysis` | AI sub-system outputs (JSONB), both bursts |
+| `questionnaires` | AI-generated questions |
+| `questionnaire_responses` | Both parties' answers |
+| `proposals` | Settlement proposal drafts and revisions |
+| `proposal_responses` | Accept/reject decisions per party |
+| `settlement_confirmations` | Typed name + signature image |
+| `mediation_reports` | PDF storage path and metadata |
+| `audit_logs` | Immutable event log (insert-only — no UPDATE or DELETE) |
+
+AI output schemas evolve frequently. JSONB columns let the schema live in Python (Pydantic models) rather than requiring an `ALTER TABLE` every time a field changes.
+
+**Party isolation:** Parties must never see each other's data. Enforced at the API layer in FastAPI routes — not only via RLS — and verified against `case_invitations` on every party request. A party cannot see the other party's questionnaire answers. Parties only see published proposals, never drafts. BATNA/WATNA numeric scores are internal to the mediator; parties see strength labels only.
+
+**`audit_logs` is insert-only by design:** legal mediation requires tamper-proof records. There is no UPDATE or DELETE policy on this table, and none should ever be added — past events must remain unmodifiable even with database access.
+
+**BATNA/WATNA column:** The `ai_analysis` table has a `batna_watna` JSONB column added after initial creation. Burst 2 saves to both `result` and `batna_watna`; `generate_proposal_revision` tries `batna_watna` first and falls back to `result`. If setting up a fresh database:
+
+```sql
+ALTER TABLE ai_analysis
+ADD COLUMN IF NOT EXISTS batna_watna JSONB;
+```
+
+**Dispute types** (defined in `ai/schemas.py`):
+
+```python
+class DisputeType(str, Enum):
+    LANDLORD_TENANT     = "landlord_tenant"
+    EMPLOYMENT          = "employment"
+    COMMERCIAL_CONTRACT = "commercial_contract"
+    NEIGHBOUR_DISPUTE   = "neighbour_dispute"
+    FAMILY_BUSINESS     = "family_business"
+    CONSTRUCTION        = "construction"
+    CONSUMER            = "consumer"
+    DEBT_RECOVERY       = "debt_recovery"
+    OTHER               = "other"
+```
+
+**Classification precedence** (when a dispute could fit multiple categories, in order): `family_business` → `landlord_tenant` → `construction` → `commercial_contract` → `employment` → `debt_recovery` → `neighbour_dispute` → `consumer` → `other`. Full boundary-case rules are documented in the prompt inside `ai/subsystems/subsystem_a.py`.
+
+Full schema setup and RLS policies are in [`docs/database.md`](docs/database.md).
 
 ---
 
-## 7. Environment variables you'll need
+## 8. Local Development Setup
 
-Backend (`nlu-backend/.env`):
-```
-SUPABASE_URL=...
-SUPABASE_KEY=...          # service role key for Celery tasks (not anon key)
-JWT_SECRET=...            # min 32 chars
-JWT_ALGORITHM=HS256
-JWT_EXPIRY_HOURS=24
-REDIS_URL=rediss://...    # Upstash, note double-s scheme for TLS
-DATABASE_URL=postgresql://...
-```
-AI (`ai/` reads from the same or a root `.env` via `load_dotenv()`):
-```
-GROQ_API_KEY=...
-ANTHROPIC_API_KEY=...     # for when you swap to Claude
-```
-Frontend (`frontend/.env` or `Env.env`):
-```
-VITE_API_URL=http://localhost:8000
-VITE_SUPABASE_URL=...
-VITE_SUPABASE_ANON_KEY=...
-```
+### Prerequisites
 
----
+- Python 3.11+
+- Node.js 18+
+- Git
+- A Supabase project (free tier works)
+- A Groq API key (free tier works)
+- An Upstash Redis database (free tier works)
 
-## 8. Running it locally
+### Backend Setup
 
-**Backend:**
-```
+```bash
+# Clone repo
+git clone https://github.com/nlu-liic-shimla/nlu-mediation-platform.git
+cd nlu-mediation-platform
+
+# Create virtual environment (from repo root)
+python -m venv venv
+venv\Scripts\activate           # Windows
+# source venv/bin/activate      # Mac/Linux
+
+# Install dependencies
 cd nlu-backend
-python -m venv venv && venv\Scripts\activate   # or source venv/bin/activate on mac/linux
 pip install -r requirements.txt
-copy .env.example .env   # then fill in real values
-uvicorn main:app --reload
+
+# Set up environment variables
+copy .env.example .env          # Windows
+# cp .env.example .env          # Mac/Linux
+# Edit .env with your actual values (see Section 10)
+
+# Run FastAPI backend (from nlu-backend/ — main.py is top-level, not inside app/)
+uvicorn main:app --reload --port 8000
 ```
 
-**Celery worker** (needed for AI pipelines to actually run — without it, cases will sit stuck in `*_PROCESSING` forever):
-```
+API docs: `http://localhost:8000/docs`
+Health check: `http://localhost:8000/api/v1/health`
+
+### Celery Worker Setup (separate terminal)
+
+```bash
 cd nlu-backend
-celery -A tasks worker --loglevel=info --pool=solo
+# Activate the same venv as above, then:
+celery -A tasks.celery_app worker --pool=solo --loglevel=info
 ```
-`--pool=solo` is required on Windows (no `prefork` support there); keep it unless you've confirmed a different deployment target.
 
-**Frontend:**
-```
+`--pool=solo` is required on Windows. On Linux/Mac you can use `--pool=prefork` for better performance.
+
+> Note: `nlu-backend/tasks.py` (root level) is the canonical Celery task file used by the running app. `app/worker/celery_app.py` is an older/parallel setup kept around from earlier dev/smoke testing — don't build new features on it.
+
+### Frontend Setup (separate terminal)
+
+```bash
 cd frontend
 npm install
+
+# Copy env template from backend folder
+copy ..\nlu-backend\frontend.env.example .env    # Windows
+# cp ../nlu-backend/frontend.env.example .env    # Mac/Linux
+# Set VITE_API_URL=http://localhost:8000
+
 npm run dev
+# Runs on http://localhost:5173
 ```
 
-**AI subsystem tests** (from repo root, not pytest-based):
+### Running Tests
+
+```bash
+# From repo root, with venv activated
+python -m pytest tests/test_subsystem_a.py -v
+python -m pytest tests/test_burst1_pipeline.py -v
+python -m pytest tests/test_scenario.py -v
 ```
-python -m tests.test_everything          # runs everything, verbose
-python -m tests.test_scenario S-01       # runs one scenario end-to-end through all subsystems
-python -m tests.test_subsystem_a         # tests just conflict extraction across all 8 scenarios
-```
-Scenario fixtures live in `tests/scenarios/S-01.json` .. `S-12.json` and cover: landlord/tenant, freelance invoice, wrongful dismissal, defective product, business partnership dissolution, property boundary, construction delay, vague/ambiguous (edge case), medical negligence, co-founder equity, debt recovery, and a double-booking refund case.
+
+Test scenarios **S-01 through S-12** in `tests/scenarios/` cover all 9 dispute types plus edge cases: landlord/tenant, freelance invoice, wrongful dismissal, defective product, business partnership dissolution, property boundary, construction delay, vague/ambiguous dispute (edge case), medical negligence, co-founder equity, debt recovery, and a double-booking refund dispute.
 
 ---
 
-## 9. Database
+## 9. Deployment
 
-Full SQL and RLS setup is in `docs/database.md` (it's written as a running changelog across Weeks 1–4, apply sections in order if setting up fresh). Key tables: `users`, `cases`, `case_invitations`, `submissions`, `documents`, `ai_analysis`, `questionnaires`, `questionnaire_responses`, `proposals`, `proposal_responses`, `settlement_confirmations`, `mediation_reports`, `audit_logs` (insert-only, enforced via RLS — never add UPDATE/DELETE policies to this table).
+### Current Setup
 
-`audit_logs` currently has two different foreign-key patterns floating around (`case_id` for real cases, `application_id` for pre-acceptance application requests, because `application_requests` isn't in the `cases` table yet at that point) — see the long comments in `nlu-backend/app/api/v1/routes/cases.py` around `_write_audit_log_safe` for why.
+| Service | Platform | Notes |
+|---|---|---|
+| Frontend | Vercel | https://nlu-mediation-platform.vercel.app |
+| Backend API | Render (Web Service) | FastAPI via Uvicorn |
+| Celery Worker | Render (Web Service) | Via `worker_web.py` |
+| Database | Supabase | PostgreSQL + Storage |
+| Redis | Upstash | Celery broker and result backend |
+
+### Celery Worker — Important Note
+
+Render's free tier does not support Background Workers. The Celery worker runs as a Web Service using `worker_web.py`, which starts the Celery worker in a background thread and exposes a `/` health endpoint.
+
+UptimeRobot pings the worker URL every 5–10 minutes to prevent Render's free tier from spinning down due to inactivity.
+
+If you upgrade to a paid Render plan: switch to a proper Background Worker service, remove the health endpoint dependency from the Celery service, and remove UptimeRobot for the worker URL (keep it for the main backend if that's still on a free tier).
+
+### Render — Backend Web Service Settings
+
+```
+Root Directory:  nlu-backend
+Build Command:   pip install -r requirements.txt
+Start Command:   uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+### Render — Celery Web Service Settings
+
+```
+Root Directory:  nlu-backend
+Build Command:   pip install -r requirements.txt
+Start Command:   python worker_web.py
+```
+
+### Vercel — Frontend Settings
+
+```
+Root Directory:  frontend
+Framework:       Vite
+Build Command:   npm run build
+Output Dir:      dist
+```
+
+Set `VITE_API_URL` to your Render backend URL in the Vercel environment variables.
+
+### Checking Logs
+
+```
+Backend logs:  Render Dashboard → backend service → Logs
+Celery logs:   Render Dashboard → celery service → Logs
+               Look for: [Burst 1] and [Burst 2] log lines
+DB queries:    Supabase Dashboard → SQL Editor
+```
+
+**Checking if Celery is actually processing:** look for `[Burst 1] Starting for case {id}` followed by `[Burst 1] Pipeline COMPLETE for case {id}` in the Celery logs. If you see "Starting" but never "COMPLETE", the task is stuck or failed silently — check for exceptions above it in the log.
 
 ---
 
-## 10. Suggested first tasks for a new developer
+## 10. Environment Variables
 
-1. Run the local setup end-to-end (backend + Celery + frontend) and walk through one full case lifecycle using scenario S-01 data, to build a mental model.
-2. Decide the fate of the duplicate Celery/API-client files (section 6) — pick one, delete/deprecate the other, update imports.
-3. Do the Groq → Claude swap in `ai/utils/ai_client.py` before any real usage, since Groq's free tier has rate limits that already show up as retry logic scattered through the questionnaire-send endpoint.
-4. Reconcile `docs/*.md` against actual code, or generate fresh docs from code — the written specs are useful context but not reliable as of this handoff.
-5. Review `frontend/src/services/api.js` for the mock/demo logic and decide whether it ships to production.
+### Backend (`nlu-backend/.env`)
+
+Copy `nlu-backend/.env.example` to `nlu-backend/.env`.
+
+```bash
+# Supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-supabase-anon-key
+
+# Database (optional — direct Postgres connection)
+DATABASE_URL=postgresql://postgres:password@host:6543/postgres?pgbouncer=true
+
+# Redis (Upstash)
+REDIS_URL=rediss://:your-password@your-host.upstash.io:6380
+CELERY_BROKER_URL=rediss://:your-password@your-host.upstash.io:6380
+
+# Groq AI (required — used by all AI sub-systems)
+GROQ_API_KEY=gsk_your_groq_api_key
+
+# JWT
+JWT_SECRET=your-generated-jwt-secret-min-32-chars
+JWT_ALGORITHM=HS256
+JWT_EXPIRY_HOURS=24
+```
+
+Generate a JWT secret:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+> **Note:** `nlu-backend/.env.example` also lists `ANTHROPIC_API_KEY` for an optional Claude fallback/swap. The running codebase currently uses Groq via `GROQ_API_KEY` — see `ai/utils/ai_client.py` for the swap-over comment block if migrating to Claude for production.
+
+### Frontend (`frontend/.env`)
+
+Copy `nlu-backend/frontend.env.example` to `frontend/.env`.
+
+```bash
+VITE_API_URL=http://localhost:8000
+VITE_SUPABASE_URL=https://your-project-id.supabase.co
+VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
+```
+
+**Never commit real `.env` files to GitHub.** They are excluded via `.gitignore`.
 
 ---
 
-*This README was generated as a handoff document summarizing the existing codebase (backend, frontend, and AI subsystems) as of the current state of the repository. It is not a substitute for reading the actual code, especially `ai/schemas.py` and `app/core/state_machine.py`, which are the two files everything else depends on.*﻿
+## 11. Known Limitations and Future Work
+
+### Current Limitations
+
+| Area | Limitation |
+|---|---|
+| Language | English only. Hindi statements produce poor extraction results. |
+| Documents | Uploaded documents are visible to the mediator via signed URLs but are not processed by any AI sub-system — the AI only reads party statements. |
+| Notifications | No email notification system. Parties must check the dashboard. |
+| Signature | Settlement uses typed name + uploaded signature image — not legally equivalent to Aadhaar eSign. |
+| Video | No live session capability. |
+| Legal precedent | AI analysis is based on party statements alone, not Indian case law. |
+| Cost monitoring | No per-case token tracking or API cost alerts. |
+| Free tier | Render free tier spins down after 15 minutes of inactivity. UptimeRobot is used as a workaround, adding cold-start latency. |
+
+### Planned Improvements (Priority Order)
+
+1. **RAG with Indian case law** — add pgvector to Supabase, seed 150+ Supreme Court / High Court judgements, embed and index by dispute type, retrieve top-3 relevant precedents per case, inject as context into Sub-systems A and D. Highest-impact item — reduces hallucination in legal analysis.
+2. **Hindi language support** — detect language of party statement, translate to English before the AI pipeline, optionally display analysis back in Hindi.
+3. **Email notifications** — SendGrid integration for invitation sent, proposal published, application accepted/rejected.
+4. **Aadhaar eSign integration** — replace typed name + image signature with NSDL/CDSL API for legally stronger settlement agreements.
+5. **Per-sub-system temperature tuning** — currently all sub-systems use `temperature=0.1`; classification tasks (A, C, G) could use `0.0` for consistency, generation tasks (B, H) could use `0.2` for more natural language.
+6. **Evaluation framework** — ground truth annotations for all test scenarios, automated accuracy measurement per deployment, before/after tracking on prompt changes.
+7. **Video mediation sessions** — WebRTC or Jitsi integration, with session recording and transcript storage.
+
+---
+
+
+## Things That Look Like Bugs But Are Not
+
+- **`cases.created_by = mediator` even in party-initiated flow** — Required by Mediation Act 2023. The mediator formally creates every case.
+- **Both parties have `role = party_user`** — Case-specific role (`requesting_party` / `against_party`) is determined via `case_invitations` and `GET /cases/{id}/my-role`.
+- **Mediatability score never changes on re-runs** — Score is deterministic Python, not LLM output.
+- **Mediator notes not in Burst 1 or Burst 2** — Notes are fed to Sub-system H only, during proposal revision.
+- **Sub-system E runs on raw text before Sub-system A** — Intentional pipeline order. Do not reorder.
+- **Celery deployed as Web Service with health endpoint** — Render free tier limitation.
+- **`audit_logs` has no update or delete endpoint** — Insert-only for legal tamper-proof requirement.
+
+---
+
+Sulah — AI-Powered Mediation Platform
+National Law University Shimla | LIIC | 2026
